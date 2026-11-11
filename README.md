@@ -13,11 +13,11 @@
 
 ## AI Studio에서 프로젝트 열기
 
-1. PC에서 ZIP의 압축을 풀고 `package.json`이 보이는 폴더를 엽니다.
-2. GitHub 저장소의 **Add file → Upload files** 화면에 그 폴더 안의 파일과 폴더를 함께 끌어 놓고 저장합니다. 업로드 목록에서 `src/main.tsx`와 `public/models/pose_landmarker_full.task`가 경로째 올라가는지 확인합니다.
-3. 저장소 첫 화면에서 `package.json` 옆에 `src`, `public`, `scripts`, `tests`가 각각 보이는지 확인합니다. 필수 파일이 빠졌으면 실행과 빌드에서 누락된 경로를 표시합니다.
-4. 새 앱은 AI Studio Build 입력창의 **＋ → Import from GitHub**에서 이 저장소를 선택합니다. 이 프로젝트와 연결된 앱을 갱신하려면 **Settings → GitHub**에서 변경 사항을 가져옵니다.
-5. Preview에서 **내 사진과 실측값**과 **사진 분석·체형 생성**을 확인합니다. 예시 사진 분석이 끝나면 3D 피팅룸에서 정면과 측면을 확인할 수 있습니다.
+1. 변경 사항을 GitHub의 main 브랜치에 올립니다.
+2. AI Studio Build에서 새 앱의 입력창 **＋ → Import from GitHub**를 열고 저장소를 선택합니다.
+3. Preview가 열리면 예시 사진 분석과 3D 피팅룸을 확인합니다.
+
+가져오기용 소스에는 분석 모델이나 WASM 바이너리를 포함하지 않습니다. 설치한 MediaPipe 패키지에서 WASM을 묶고, 사진 분석을 시작할 때 Google의 버전 고정 모델을 받습니다. 미리보기에서 공식 모델 주소에 접속할 수 있어야 사진을 분석할 수 있습니다.
 
 [AI Studio 공식 안내](https://aistudio.google.com/docs/aistudio-build-mode)
 
@@ -33,7 +33,7 @@
 
 ## 내 컴퓨터에서 실행
 
-Node.js 22.12 이상 또는 24 버전이 필요합니다. 이 수정본은 Node.js 24에서 검사했습니다.
+Node.js 20 이상에서 실행합니다. 새로 설치할 때는 지원 중인 Node.js LTS 버전을 사용하세요.
 
 압축을 푼 프로젝트 폴더에서 터미널을 열고 실행합니다.
 
@@ -64,35 +64,13 @@ index.html을 직접 더블클릭하는 방식으로는 실행하지 않습니�
 
 ## 분석 자원
 
-아래 파일이 프로젝트에 포함되어 있어 실행 시 외부 CDN 다운로드가 필요하지 않습니다.
+MediaPipe 1.2.2의 WASM 로더와 바이너리는 설치된 npm 패키지에서 앱과 함께 묶습니다. 시연 사진은 가져오기에서 이미지 파일이 누락돼도 표시되도록 텍스트 형태로 포함했습니다.
 
-- public/models/pose_landmarker_full.task
-- public/models/face_landmarker.task
-- public/mediapipe/wasm/vision_wasm_internal.js
-- public/mediapipe/wasm/vision_wasm_internal.wasm
-- public/mediapipe/wasm/vision_wasm_module_internal.js
-- public/mediapipe/wasm/vision_wasm_module_internal.wasm
+사진 분석은 브라우저에서 처리합니다. 모델 파일은 버전이 고정된 공식 주소에서 다운로드합니다. 프로젝트의 환경 변수로 호환 모델 주소를 지정할 수 있습니다.
 
-자원이 빠졌다면 의존성 설치 후 다음 명령으로 준비할 수 있습니다.
-
-    npm run prepare:vision
-
-MediaPipe JS 패키지와 정적 WASM 자원은 같은 1.2.2 버전을 사용합니다. 패키지 버전만 올리지 마세요.
-
-모델 출처:
-https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
-
-모델 SHA-256:
-5134a3aad27a58b93da0088d431f366da362b44e3ccfbe3462b3827a839011b1
-
-턱 위치 검출을 위한 Face Landmarker 모델 출처:
-https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
-
-Face Landmarker 모델 SHA-256:
-64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
-
-Google MediaPipe 라이선스는 public/mediapipe/LICENSE에 포함했습니다.
-공식 문서: https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker/web_js
+- [Pose Landmarker Full](https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task)
+- [Face Landmarker](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task)
+- [MediaPipe 공식 문서](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker/web_js)
 
 ## 확인 명령
 

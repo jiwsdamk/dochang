@@ -322,24 +322,93 @@ type PoseResult = {
   segmentationMasks?: Array<{ width: number; height: number; getAsFloat32Array: () => Float32Array; close: () => void }>;
 };
 type PoseDetector = { detect: (image: HTMLCanvasElement, callback: (result: PoseResult) => void) => void };
+
+const modelAssets = {
+  pose: {
+    label: '자세 분석',
+    url: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
+    sha256: '5134a3aad27a58b93da0088d431f366da362b44e3ccfbe3462b3827a839011b1',
+  },
+  face: {
+    label: '얼굴 지점 분석',
+    url: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+    sha256: '64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff',
+  },
+} as const;
+const MAX_MODEL_BYTES = 32 * 1024 * 1024;
+const MODEL_DOWNLOAD_TIMEOUT_MS = 25_000;
+
+async function loadVisionWasm() {
+  const override = import.meta.env.VITE_MEDIAPIPE_WASM_URL?.trim();
+  if (override) {
+    const { FilesetResolver } = await import('@mediapipe/tasks-vision');
+    return FilesetResolver.forVisionTasks(override.replace(/\/+$/, ''), false);
+  }
+  // Use the pinned SDK's exported classic loader and binary. Vite emits the
+  // exact asset URLs, including their independent production content hashes.
+  const [loader, binary] = await Promise.all([
+    import('@mediapipe/tasks-vision/vision_wasm_internal.js?url'),
+    import('@mediapipe/tasks-vision/vision_wasm_internal.wasm?url'),
+  ]);
+  return { wasmLoaderPath: loader.default, wasmBinaryPath: binary.default };
+}
+
+async function downloadModel(kind: keyof typeof modelAssets, override?: string): Promise<Uint8Array<ArrayBuffer>> {
+  const asset = modelAssets[kind];
+  const customUrl = override?.trim();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const response = await fetch(customUrl || asset.url, { signal: controller.signal });
+    if (!response.ok) throw new Error(asset.label + ' 모델을 내려받지 못했어요. HTTP ' + response.status + '.');
+    const contentLength = Number(response.headers.get('content-length'));
+    if (contentLength > MAX_MODEL_BYTES) throw new Error(asset.label + ' 모델 파일 크기가 32MB를 넘어요.');
+    const data = await response.arrayBuffer();
+    if (data.byteLength < 1024 || data.byteLength > MAX_MODEL_BYTES) {
+      throw new Error(asset.label + ' 모델의 파일 크기가 올바르지 않아요.');
+    }
+    const bytes = new Uint8Array(data);
+    // MediaPipe task bundles can place two padding bytes before the ZIP header.
+    // This also rejects HTML returned with HTTP 200 by a preview server.
+    const hasZipHeader = (offset: number) => bytes[offset] === 0x50 && bytes[offset + 1] === 0x4b
+      && bytes[offset + 2] === 0x03 && bytes[offset + 3] === 0x04;
+    if (!hasZipHeader(0) && !hasZipHeader(2)) {
+      throw new Error(asset.label + ' 모델 주소에서 올바른 MediaPipe .task 파일을 받지 못했어요.');
+    }
+    if (!customUrl && globalThis.crypto?.subtle) {
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+      const checksum = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+      if (checksum !== asset.sha256) throw new Error(asset.label + ' 모델 파일의 검증값이 일치하지 않아요.');
+    }
+    return bytes;
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(asset.label + ' 모델 다운로드 시간이 초과됐어요.');
+    if (error instanceof TypeError) throw new Error(asset.label + ' 모델 주소에 연결하지 못했어요. 네트워크와 모델 주소를 확인해주세요.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 let detectorPromise: Promise<PoseDetector> | null = null;
 async function getDetector(): Promise<PoseDetector> {
   if (!detectorPromise) {
     detectorPromise = (async () => {
-      const { FilesetResolver, PoseLandmarker } = await import('@mediapipe/tasks-vision');
-      const base = import.meta.env.BASE_URL || '/';
-      const wasmPath = import.meta.env.VITE_MEDIAPIPE_WASM_URL || base + 'mediapipe/wasm';
-      const modelPath = import.meta.env.VITE_POSE_MODEL_URL || base + 'models/pose_landmarker_full.task';
-      const files = await FilesetResolver.forVisionTasks(wasmPath);
+      const { PoseLandmarker } = await import('@mediapipe/tasks-vision');
+      const [files, model] = await Promise.all([
+        loadVisionWasm(),
+        downloadModel('pose', import.meta.env.VITE_POSE_MODEL_URL),
+      ]);
       return await PoseLandmarker.createFromOptions(files, {
-        baseOptions: { modelAssetPath: modelPath, delegate: 'CPU' },
+        baseOptions: { modelAssetBuffer: model, delegate: 'CPU' },
         runningMode: 'IMAGE', numPoses: 1, outputSegmentationMasks: true,
         minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5,
       }) as unknown as PoseDetector;
     })().catch(error => {
       detectorPromise = null;
       console.error('Pose model initialization failed:', error);
-      throw new Error('실제 사진 분석 모델을 불러오지 못했어요. public/models와 public/mediapipe/wasm 파일 또는 네트워크 설정을 확인한 뒤 다시 시도해주세요. 기본 체형으로 대체하지 않았습니다.');
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error('사진 분석 모델을 시작하지 못했어요. ' + reason);
     });
   }
   return detectorPromise;
@@ -350,11 +419,13 @@ let faceDetectorPromise: Promise<FaceDetector> | null = null;
 async function getFaceDetector(): Promise<FaceDetector> {
   if (!faceDetectorPromise) {
     faceDetectorPromise = (async () => {
-      const { FilesetResolver, FaceLandmarker } = await import('@mediapipe/tasks-vision');
-      const base = import.meta.env.BASE_URL || '/';
-      const files = await FilesetResolver.forVisionTasks(import.meta.env.VITE_MEDIAPIPE_WASM_URL || base+'mediapipe/wasm');
+      const { FaceLandmarker } = await import('@mediapipe/tasks-vision');
+      const [files, model] = await Promise.all([
+        loadVisionWasm(),
+        downloadModel('face', import.meta.env.VITE_FACE_MODEL_URL),
+      ]);
       return await FaceLandmarker.createFromOptions(files, {
-        baseOptions: {modelAssetPath:import.meta.env.VITE_FACE_MODEL_URL || base+'models/face_landmarker.task',delegate:'CPU'},
+        baseOptions: {modelAssetBuffer:model,delegate:'CPU'},
         runningMode:'IMAGE',numFaces:1,minFaceDetectionConfidence:0.5,minFacePresenceConfidence:0.5,
         outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false,
       }) as unknown as FaceDetector;

@@ -1,17 +1,8 @@
-import test, { before, after } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer, type ViteDevServer } from 'vite';
 import { observePhotoMask, type Landmark, type PhotoPairObservation } from '../src/utils/photoObservation';
+import { calculateBodyDimensions as calculate } from '../src/utils/photoAnalyzer';
 import type { BodyInputData } from '../src/types/body';
-
-let server: ViteDevServer;
-let calculate: typeof import('../src/utils/photoAnalyzer')['calculateBodyDimensions'];
-before(async () => {
-  // Vite resolves bundled JPG imports just as in the real application.
-  server = await createServer({ configFile: false, server: { middlewareMode: true }, appType: 'custom' });
-  calculate = (await server.ssrLoadModule('/src/utils/photoAnalyzer.ts')).calculateBodyDimensions;
-});
-after(async () => { await server?.close(); });
 
 const input: BodyInputData = {
   calibrationPart:'height',calibrationValue:178,height:178,shoulderWidth:46.5,

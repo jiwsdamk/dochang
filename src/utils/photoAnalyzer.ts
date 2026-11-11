@@ -11,8 +11,7 @@ import type {
 } from '../types/body';
 import { calculateRamanujanPerimeter, classifyBodyType } from './mathRamanujan';
 import { inspectPhotoPair, type PhotoPairObservation, type PhotoViewObservation, type Span } from './photoObservation';
-import frontSample from '../assets/images/front_body_sample_1793777372349.jpg';
-import sideSample from '../assets/images/side_body_sample_1793777384667.jpg';
+import { frontSample, sideSample } from '../assets/samplePhotos';
 
 export { inspectPhotoPair } from './photoObservation';
 export type { PhotoPairObservation } from './photoObservation';
