@@ -1,0 +1,6 @@
+{
+  "name": "FitDimension 3D - 체형 측정 기반 3D 가상 아바타 & 피팅룸",
+  "description": "사진과 실측값을 결합한 정밀 신체 치수 계산 및 해부학적 3D 체형 아바타 생성 가상 피팅룸 서비스",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
