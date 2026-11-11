@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { createParametricAvatar } from '../src/components/AvatarGenerator';
-import type { CalculatedBodyDimensions, ClothingOptions, DimensionMetric } from '../src/types/body';
+import type { BodyPhotoProfile, CalculatedBodyDimensions, ClothingOptions, DimensionMetric } from '../src/types/body';
 
 const baseValues = {
   height:178, headHeight:23.5, headWidth:15.5, neckLength:9.5,
@@ -128,6 +128,14 @@ test('observed thigh and calf lengths retain the photographed knee and ankle hei
   close(anchors.ankleY*100,81.5-42-34,0.01);
   close((anchors.kneeY-anchors.ankleY)*100,34,0.01);
   close((anchors.crotchY-anchors.kneeY)*100,42,0.01);
+  for (const side of ['Left', 'Right']) {
+    const foot = a.group.getObjectByName(`${side}Foot`) as THREE.Mesh;
+    const leg = a.group.getObjectByName(`${side}LegSurface`) as THREE.Mesh;
+    const footBounds = new THREE.Box3().setFromObject(foot);
+    const legBounds = new THREE.Box3().setFromObject(leg);
+    close(footBounds.min.y, 0, 0.0001);
+    assert.ok(footBounds.max.y > legBounds.min.y, 'foot must overlap the ankle');
+  }
   const torso=a.group.getObjectByName('TorsoNeckSurface') as THREE.Mesh;
   const p=torso.geometry.getAttribute('position'),n=torso.geometry.getAttribute('normal');
   let frontNormals=0;
@@ -160,3 +168,52 @@ test('turntable world translation, rotation and scale do not change avatar-local
   close(after.measuredInseam,81.5,0.1);
 });
 
+test('distinct photo cross sections change projected geometry while manual anchors stay fixed', () => {
+  const profile = (wider: boolean): BodyPhotoProfile => ({
+    torso: [0.55, 0.60, 0.65].map(t => ({
+      t, widthCm: wider ? 35 : 27, depthCm: wider ? 27 : 19,
+      centerXCm: wider ? 2 : 0, centerZCm: wider ? 2 : 0,
+    })),
+    head: [{t: 0.50, widthCm: wider ? 17 : 14, depthCm: 19, centerXCm: 0}],
+    neck: [{t: 0.60, widthCm: wider ? 13 : 10, depthCm: 11, centerXCm: 0}],
+    arms: [[{t: 0.22, widthCm: wider ? 9 : 6, centerXCm: -24}], []],
+    legs: [[{t: 0.30, widthCm: wider ? 13 : 10, centerXCm: wider ? -11 : -9}], []],
+  });
+  const fitted = dimensions({bellyProtrusion: 0});
+  const a = createParametricAvatar({...fitted, photoShape: profile(false)}, clothing, false);
+  const b = createParametricAvatar({...fitted, photoShape: profile(true)}, clothing, false);
+  const slice = (group: THREE.Group, meshName: string, y: number) => {
+    const mesh = group.getObjectByName(meshName) as THREE.Mesh;
+    const points = mesh.geometry.getAttribute('position');
+    const box = new THREE.Box3();
+    for (let i = 0; i < points.count; i++) {
+      if (Math.abs(points.getY(i) - y) < 1e-5) {
+        box.expandByPoint(new THREE.Vector3().fromBufferAttribute(points, i));
+      }
+    }
+    assert.ok(!box.isEmpty(), meshName);
+    return box;
+  };
+  const {crotchY, shoulderY, chinY, ankleY} = a.group.userData.anatomicalReferences;
+  const y = THREE.MathUtils.lerp(crotchY, shoulderY, 0.60);
+  const narrow = slice(a.group, 'TorsoNeckSurface', y);
+  const wide = slice(b.group, 'TorsoNeckSurface', y);
+  close(wide.getSize(new THREE.Vector3()).x * 100, 35, 0.1);
+  close(narrow.getSize(new THREE.Vector3()).z * 100, 19, 0.1);
+  close(wide.getCenter(new THREE.Vector3()).x * 100, 2, 0.1);
+  assert.ok(wide.max.z - narrow.max.z > 0.05);
+  for (const [meshName, level] of [
+    ['NeutralHead', (chinY + 1.78) / 2],
+    ['TorsoNeckSurface', THREE.MathUtils.lerp(shoulderY, chinY, 0.60)],
+    ['LeftLegSurface', THREE.MathUtils.lerp(ankleY, crotchY, 0.30)],
+  ] as const) {
+    assert.ok(slice(b.group, meshName, level).getSize(new THREE.Vector3()).x >
+      slice(a.group, meshName, level).getSize(new THREE.Vector3()).x + 0.02, meshName);
+  }
+  for (const key of [
+    'measuredHeight', 'measuredChestCircumference', 'measuredWaistCircumference',
+    'measuredHipCircumference', 'measuredUpperArmGirth', 'measuredThighGirth', 'measuredArmLength',
+  ] as const) {
+    close(a.measurements[key], b.measurements[key], 0.15);
+  }
+});

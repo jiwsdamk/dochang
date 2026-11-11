@@ -193,7 +193,7 @@ export default function App() {
             <section ref={resultSectionRef} className="lg:col-span-8 min-w-0 scroll-mt-3">
               {dimensions ? (
                 <>
-                  <div className={viewerHeight}><ThreeFittingRoom dimensions={dimensions} clothingOptions={clothingOptions} showTapeMeasures={showTapeMeasures} onToggleTapeMeasures={() => setShowTapeMeasures(value => !value)} onModelMeasurementsUpdated={handleMeasurements} /></div>
+                  <div className={viewerHeight}><ThreeFittingRoom dimensions={dimensions} photoSource={bodyInput.isSamplePhoto ? 'sample' : 'upload'} clothingOptions={clothingOptions} showTapeMeasures={showTapeMeasures} onToggleTapeMeasures={() => setShowTapeMeasures(value => !value)} onModelMeasurementsUpdated={handleMeasurements} /></div>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
                     {[
                       ['몸통 / 다리', dimensions.torsoLength, dimensions.inseam],

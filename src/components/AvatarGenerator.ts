@@ -1,13 +1,11 @@
 /**
  * @license SPDX-License-Identifier: Apache-2.0
  *
- * A dimension-driven, neutral fitting mannequin.
- * This renderer does not infer body shape from a photograph. It consumes the
- * explicit measurements/estimates supplied by the image-analysis pipeline.
- * Its mesh measurements check construction consistency, not real-body accuracy.
+ * A neutral fitting avatar built from body measurements and photo cross sections.
+ * Mesh measurements check how the avatar was constructed.
  */
 import * as THREE from 'three';
-import { CalculatedBodyDimensions, ClothingOptions, ModelMeshMeasurements } from '../types/body';
+import type { BodyProfileRow, CalculatedBodyDimensions, ClothingOptions, ModelMeshMeasurements } from '../types/body';
 
 export interface AvatarBuildResult {
   group: THREE.Group;
@@ -55,6 +53,92 @@ function sectionAt(sections: Section[], y: number): Section {
   };
 }
 
+type ProfileField = 'widthCm' | 'depthCm' | 'centerXCm' | 'centerZCm';
+
+/** Regularize isolated mask spikes. Keep extended changes such as a fuller calf. */
+function profileChannel(rows: BodyProfileRow[], field: ProfileField): Array<{t: number; value: number}> {
+  const values = new Map<number, number>();
+  for (const row of rows) {
+    const value = row[field];
+    if (!Number.isFinite(row.t) || row.t < 0 || row.t > 1 || value === undefined || !Number.isFinite(value)) continue;
+    if ((field === 'widthCm' || field === 'depthCm') && value <= 0) continue;
+    values.set(row.t, value / 100);
+  }
+  const sorted = [...values].sort(([a], [b]) => a - b).map(([t, value]) => ({t, value}));
+  const limited = sorted.map((row, i) => {
+    const a = sorted[i - 1], b = sorted[i + 1];
+    if (!a || !b || b.t - a.t > 0.12) return row;
+    const nearby = lerp(a.value, b.value, (row.t - a.t) / (b.t - a.t));
+    const tolerance = Math.max(0.014, Math.abs(b.value - a.value) * 0.9);
+    return {t: row.t, value: clamp(row.value, nearby - tolerance, nearby + tolerance)};
+  });
+  return limited.map((row, i) => {
+    // Dampen one-row fabric/segmentation steps while keeping sustained curves.
+    let total = row.value * 4, weight = 4;
+    for (const j of [i - 2, i - 1, i + 1, i + 2]) {
+      const neighbour = limited[j];
+      if (!neighbour || Math.abs(neighbour.t - row.t) > 0.068) continue;
+      const w = Math.abs(j - i) === 1 ? 2 : 1;
+      total += neighbour.value * w; weight += w;
+    }
+    return {t: row.t, value: total / weight};
+  });
+}
+
+/** Interpolate adjacent observations without bridging large occluded intervals. */
+function observedAt(channel: Array<{t: number; value: number}>, t: number): number | undefined {
+  const index = channel.findIndex(row => row.t >= t);
+  const right = index < 0 ? undefined : channel[index];
+  const left = index < 0 ? channel.at(-1) : channel[index - 1];
+  if (left && right && right.t - left.t < 0.19) {
+    return lerp(left.value, right.value, (t - left.t) / (right.t - left.t));
+  }
+  const nearest = left && right ? (t - left.t < right.t - t ? left : right) : left ?? right;
+  return nearest && Math.abs(nearest.t - t) <= 0.05 ? nearest.value : undefined;
+}
+
+/** Convert observed cross sections to mesh rings while retaining the fit anchors. */
+function withPhotoProfile(
+  baseline: Section[], rows: BodyProfileRow[] | undefined, bottom: number, top: number,
+  options: { lockSizeAt?: number[]; maxCenterShift: number; blendIntoTopAt?: number; preserveBulge?: boolean },
+): Section[] {
+  if (!rows?.length || top <= bottom) return baseline;
+  const width = profileChannel(rows, 'widthCm');
+  if (!width.length) return baseline;
+  const depth = profileChannel(rows, 'depthCm');
+  const centerX = profileChannel(rows, 'centerXCm');
+  const centerZ = profileChannel(rows, 'centerZCm');
+  const levels = baseline.map(row => row.y);
+  for (const {t} of width) {
+    const y = lerp(bottom, top, t);
+    if (!levels.some(level => Math.abs(level - y) < 0.00005)) levels.push(y);
+  }
+  levels.sort((a, b) => a - b);
+  return levels.map(y => {
+    const base = sectionAt(baseline, y);
+    if (y < bottom || y > top) return base;
+    const t = (y - bottom) / (top - bottom);
+    const w = observedAt(width, t), d = observedAt(depth, t);
+    const x = observedAt(centerX, t), z = observedAt(centerZ, t);
+    const weight = options.blendIntoTopAt === undefined
+      ? 1 : 1 - THREE.MathUtils.smoothstep(t, options.blendIntoTopAt, 1);
+    const lockSize = options.lockSizeAt?.some(level => Math.abs(level - y) < 0.00005);
+    const radius = (value: number | undefined, fallback: number) => value === undefined
+      ? fallback : lerp(fallback, clamp(value / 2, fallback * 0.4, fallback * 1.85), weight);
+    const center = (value: number | undefined, fallback = 0) => value === undefined
+      ? fallback : lerp(fallback, clamp(value, fallback - options.maxCenterShift, fallback + options.maxCenterShift), weight);
+    const rx = lockSize ? base.rx : radius(w, base.rx);
+    // A missing side observation leaves an inferred ellipse depth. The aspect
+    // ratio follows the neutral section so a measured width still affects girth.
+    const rz = lockSize ? base.rz : d === undefined
+      ? base.rz * clamp(rx / Math.max(base.rx, 0.0001), 0.65, 1.55)
+      : radius(d, base.rz);
+    return { ...base, rx, rz, cx: center(x, base.cx), cz: center(z, base.cz),
+      // A side contour already includes the abdomen's depth.
+      bulge: d === undefined || options.preserveBulge ? base.bulge : lerp(base.bulge || 0, 0, weight) };
+  });
+}
+
 function pointOnSection(s: Section, angle: number): THREE.Vector3 {
   const forward = Math.max(0, Math.cos(angle));
   return new THREE.Vector3(
@@ -69,10 +153,12 @@ function loft(sectionsInput: Section[], rows = 100, radial = 48, cap = true): TH
   const sections = [...sectionsInput].sort((a, b) => a.y - b.y);
   const positions: number[] = [], indices: number[] = [];
   const lo = sections[0].y, hi = sections[sections.length - 1].y;
-  const ys = Array.from(new Set([
-    ...Array.from({ length: rows + 1 }, (_, i) => lerp(lo, hi, i / rows)),
-    ...sections.map(s => s.y),
-  ])).sort((a, b) => a - b);
+  const levels = sections.map(s => s.y);
+  const regularLevels = Array.from({ length: rows + 1 }, (_, i) => lerp(lo, hi, i / rows));
+  const ys = [...new Set([
+    ...levels,
+    ...regularLevels.filter(y => !levels.some(level => Math.abs(level - y) < 0.0001)),
+  ])].sort((a, b) => a - b);
   for (const y of ys) {
     const s = sectionAt(sections, y);
     for (let j = 0; j <= radial; j++) {
@@ -235,7 +321,8 @@ export function createParametricAvatar(
     const shoulderY = I + T;
     const bellyFraction = (bellyY - waistY) / (chestY - waistY);
 
-    const torsoSections: Section[] = [
+    const photoShape = d.photoShape;
+    const neutralTorso: Section[] = [
       { y: I, rx: hipW * 0.37, rz: hipD * 0.37 },
       { y: hipY, rx: hipW / 2, rz: hipD / 2, cz: -hipD * 0.035 },
       // The measured waist depth already includes the abdomen. Do not add it twice.
@@ -248,23 +335,70 @@ export function createParametricAvatar(
       { y: lerp(shoulderY + rise, chinY, 0.50), rx: neckW / 2, rz: neckD / 2, cz: -0.008 },
       { y: chinY + headH * 0.18, rx: neckW * 0.43, rz: neckD * 0.42, cz: -headH * 0.12 },
     ];
+    const observedTorso = withPhotoProfile(neutralTorso, photoShape?.torso, I, shoulderY, {
+      lockSizeAt: [
+        I, shoulderY,
+        ...(d.hipCircumference.source === 'manual' ? [hipY] : []),
+        ...(d.waistCircumference.source === 'manual' ? [waistY] : []),
+        ...(d.chestCircumference.source === 'manual' ? [chestY] : []),
+      ],
+      maxCenterShift: 0.10,
+      preserveBulge: d.bellyProtrusion.source === 'manual',
+    });
+    const shoulderProfile = sectionAt(observedTorso, shoulderY);
+    const neckBaseline = observedTorso.map(row => row.y <= shoulderY ? row : {
+      ...row, cx: (row.cx || 0) + (shoulderProfile.cx || 0),
+      cz: (row.cz || 0) + (shoulderProfile.cz || 0),
+    });
+    const torsoSections = withPhotoProfile(neckBaseline, photoShape?.neck, shoulderY, chinY, {
+      lockSizeAt: [shoulderY], maxCenterShift: 0.075,
+    });
+    const neckAtChin = sectionAt(torsoSections, chinY);
+    let headGeo: THREE.BufferGeometry;
+    const hasHeadProfile = Boolean(photoShape?.head.length);
+    if (hasHeadProfile) {
+      const headBaseline = Array.from({length: 9}, (_, i) => {
+        const t = i / 8, y = 2 * t - 1;
+        const radial = Math.sqrt(Math.max(0, 1 - y * y));
+        const jaw = y < -0.15 ? lerp(0.72, 1, (y + 1) / 0.85) : 1;
+        const chin = i === 0;
+        return { y: chinY + t * headH,
+          rx: chin ? Math.min(neckAtChin.rx * 0.95, headW / 2) : Math.max(0.001, headW * 0.5 * radial * jaw),
+          rz: chin ? Math.min(neckAtChin.rz * 0.95, headH * 0.36) : Math.max(0.001, headH * 0.43 * radial),
+          cx: neckAtChin.cx, cz: (neckAtChin.cz || 0) + headH * 0.04 };
+      });
+      const headRows = withPhotoProfile(headBaseline, photoShape?.head, chinY, H, {
+        lockSizeAt: [chinY, H], maxCenterShift: 0.085,
+      });
+      headGeo = loft(headRows, 76, 48);
+      // Keep the hidden neck cap inside the observed head, even with a tilted head.
+      const cap = torsoSections.at(-1)!;
+      const headAtCap = sectionAt(headRows, cap.y);
+      cap.cx = headAtCap.cx;
+      cap.cz = (headAtCap.cz || 0) - 0.012;
+      cap.rx = Math.min(cap.rx, headAtCap.rx * 0.83);
+      cap.rz = Math.min(cap.rz, headAtCap.rz * 0.76);
+    } else {
+      headGeo = new THREE.SphereGeometry(1, 48, 40);
+      const hp = headGeo.getAttribute('position');
+      for (let k = 0; k < hp.count; k++) {
+        const y = hp.getY(k);
+        const jaw = y < -0.15 ? lerp(0.72, 1, clamp((y + 1) / 0.85, 0, 1)) : 1;
+        hp.setXYZ(k, hp.getX(k) * headW * 0.5 * jaw + (neckAtChin.cx || 0),
+          chinY + headH * (y + 1) * 0.5,
+          hp.getZ(k) * headH * 0.43 + (y < 0 ? 0.007 * -y : -0.004 * y));
+      }
+      headGeo.computeVertexNormals(); headGeo.computeBoundingBox();
+    }
     const torso = add(loft(torsoSections, 130, 56), suit, 'TorsoNeckSurface');
     torso.userData.sections = torsoSections;
-    const headGeo = new THREE.SphereGeometry(1, 48, 40);
-    const hp = headGeo.getAttribute('position');
-    for (let k = 0; k < hp.count; k++) {
-      const y = hp.getY(k);
-      const jaw = y < -0.15 ? lerp(0.72, 1, clamp((y + 1) / 0.85, 0, 1)) : 1;
-      hp.setXYZ(k, hp.getX(k) * headW * 0.5 * jaw,
-        chinY + headH * (y + 1) * 0.5,
-        hp.getZ(k) * headH * 0.43 + (y < 0 ? 0.007 * -y : -0.004 * y));
-    }
-    headGeo.computeVertexNormals(); headGeo.computeBoundingBox();
     const head = add(headGeo, skin, 'NeutralHead');
-    const face = new THREE.Mesh(new THREE.SphereGeometry(1, 18, 12), skin);
-    face.geometry.scale(headW * 0.045, headH * 0.055, headH * 0.065);
-    face.position.set(0, chinY + headH * 0.36, headH * 0.38);
-    face.name = 'NeutralNose'; body.add(face);
+    if (!hasHeadProfile) {
+      const face = new THREE.Mesh(new THREE.SphereGeometry(1, 18, 12), skin);
+      face.geometry.scale(headW * 0.045, headH * 0.055, headH * 0.065);
+      face.position.set(neckAtChin.cx || 0, chinY + headH * 0.36, headH * 0.38);
+      face.name = 'NeutralNose'; body.add(face);
+    }
 
     const upperL = safe(d.upperArmLength.value, H * 0.18);
     const foreL = safe(d.forearmLength.value, H * 0.15);
@@ -284,7 +418,6 @@ export function createParametricAvatar(
     const observedAnkleY = I - thighRaw - calfRaw;
     const hasFootObservation = observedAnkleY > H * 0.009 && observedAnkleY < H * 0.075;
     const ankleY = hasFootObservation ? observedAnkleY : H * 0.036 * 0.83;
-    const footH = clamp(ankleY * 1.12, H * 0.025, H * 0.055);
     const kneeY = hasFootObservation
       ? ankleY + calfRaw
       : ankleY + (I - ankleY) * calfRaw / (thighRaw + calfRaw);
@@ -295,6 +428,7 @@ export function createParametricAvatar(
     const legX = Math.max(thighW * 0.44, hipW / 2 - thighW * 0.46);
     const armAngle = 0.065;
     const armL = upperL + foreL;
+    const hipProfile = sectionAt(torsoSections, hipY);
     const armSectionsBySide: Section[][] = [];
     const armMeshes: THREE.Mesh[] = [], legMeshes: THREE.Mesh[] = [];
     const armFrames: { shoulder: THREE.Vector3; elbow: THREE.Vector3; wrist: THREE.Vector3 }[] = [];
@@ -302,15 +436,26 @@ export function createParametricAvatar(
     const hemShorten = c.alterations.enabled ? c.alterations.hemShorten / 100 : 0;
     const waistAdjust = c.alterations.enabled ? c.alterations.waistAdjustment / 100 : 0;
 
-    for (const side of [-1, 1]) {
-      const sx = side * (shoulderW / 2 - upperW * 0.28);
+    for (const index of [0, 1] as const) {
+      const side = index === 0 ? -1 : 1;
+      const sx = (shoulderProfile.cx || 0) + side * (shoulderW / 2 - upperW * 0.28);
+      const armRows = photoShape?.arms[index];
+      const wristHeight = photoShape?.armWristHeightCm?.[index];
+      const observedDrop = wristHeight === undefined ? NaN : shoulderY - wristHeight / 100;
+      const useObservedDrop = d.armLength.source !== 'manual' && Number.isFinite(observedDrop)
+        && observedDrop > armL * 0.65 && observedDrop < armL * 1.10;
+      const drop = useObservedDrop ? observedDrop : armL * Math.cos(armAngle);
       const armAt = (distance: number, rx: number, rz: number): Section => ({
-        y: shoulderY - distance * Math.cos(armAngle),
-        cx: sx + side * distance * Math.sin(armAngle), cz: 0.003,
+        y: shoulderY - distance / armL * drop,
+        cx: sx + side * distance * Math.sin(armAngle), cz: (shoulderProfile.cz || 0) + 0.003,
         rx, rz,
       });
-      const armSections: Section[] = [
-        armAt(-0.012, upperW * 0.17, upperD * 0.17),
+      const neutralArm: Section[] = [
+        photoShape ? {
+          ...armAt(-0.010, upperW * 0.12, upperD * 0.13),
+          cx: sx - side * upperW * 0.52,
+        } : armAt(-0.012, upperW * 0.17, upperD * 0.17),
+        ...(photoShape ? [armAt(0, upperW * 0.28, upperD * 0.34)] : []),
         armAt(upperL * 0.09, upperW * 0.46, upperD * 0.46),
         armAt(upperL * 0.34, upperW / 2, upperD / 2),
         armAt(upperL * 0.80, upperW * 0.36, upperD * 0.37),
@@ -319,18 +464,49 @@ export function createParametricAvatar(
         armAt(upperL + foreL * 0.68, foreW * 0.39, foreD * 0.39),
         armAt(armL, foreW * 0.27, foreD * 0.28),
       ].sort((a, b) => a.y - b.y);
-      const arm = add(loft(armSections, 92, 40), suit, side < 0 ? 'LeftArmSurface' : 'RightArmSurface');
-      armSectionsBySide.push(armSections); armMeshes.push(arm);
-      const positionAt = (distance: number) => {
-        const p = armAt(distance, 0, 0);
+      const shoulderAnchor = armAt(0, 0, 0).y;
+      const elbowAnchor = armAt(upperL, 0, 0).y;
+      const wristAnchor = armAt(armL, 0, 0).y;
+      let armSections = withPhotoProfile(neutralArm, armRows, wristAnchor, shoulderAnchor, {
+        lockSizeAt: d.upperArmGirth.source === 'manual' ? [armAt(upperL * 0.34, 0, 0).y] : [],
+        maxCenterShift: 0.13,
+        blendIntoTopAt: 0.80,
+      });
+      const positionAt = (y: number) => {
+        const p = sectionAt(armSections, y);
         return new THREE.Vector3(p.cx, p.y, p.cz);
       };
-      const frame = { shoulder: positionAt(0), elbow: positionAt(upperL), wrist: positionAt(armL) };
+      const frame = {
+        shoulder: positionAt(shoulderAnchor),
+        elbow: positionAt(elbowAnchor),
+        wrist: positionAt(wristAnchor),
+      };
+      if (!armRows?.length) {
+        // Match the centreline of the neutral arm even between loft rings.
+        const neutralShoulder = armAt(0, 0, 0);
+        frame.shoulder.set(neutralShoulder.cx || 0, neutralShoulder.y, neutralShoulder.cz || 0);
+      } else if (d.armLength.source === 'manual') {
+        // Retain photographed lateral offsets while enforcing the manually
+        // measured shoulder-to-wrist lengths along the two arm segments.
+        const verticalDrop = (length: number, a: THREE.Vector3, b: THREE.Vector3) =>
+          Math.sqrt(Math.max(length * length * 0.10, length * length - (a.x - b.x) ** 2 - (a.z - b.z) ** 2));
+        frame.elbow.y = shoulderY - verticalDrop(upperL, frame.shoulder, frame.elbow);
+        frame.wrist.y = frame.elbow.y - verticalDrop(foreL, frame.elbow, frame.wrist);
+        armSections = armSections.map(s => ({
+          ...s,
+          y: s.y > shoulderAnchor ? s.y : s.y >= elbowAnchor
+            ? lerp(frame.elbow.y, shoulderY, (s.y - elbowAnchor) / (shoulderAnchor - elbowAnchor))
+            : lerp(frame.wrist.y, frame.elbow.y, (s.y - wristAnchor) / (elbowAnchor - wristAnchor)),
+        }));
+      }
+      const arm = add(loft(armSections, 92, 40), suit, side < 0 ? 'LeftArmSurface' : 'RightArmSurface');
+      armSectionsBySide.push(armSections); armMeshes.push(arm);
       armFrames.push(frame);
       const handH = headH * 0.72, wrist = frame.wrist;
-      const palmW = Math.max(foreW * 0.72, headW * 0.39);
+      const wristSection = sectionAt(armSections, wrist.y);
+      const palmW = Math.max(foreW * 0.72, headW * 0.39, wristSection.rx * 2.1);
       const handRows: Section[] = [
-        { y: wrist.y + 0.008, rx: foreW * 0.27, rz: foreD * 0.28, cx: wrist.x, cz: wrist.z },
+        { ...wristSection, y: wrist.y + 0.008 },
         { y: wrist.y - handH * 0.28, rx: palmW / 2, rz: palmW * 0.23, cx: wrist.x + side * 0.006, cz: wrist.z },
         { y: wrist.y - handH * 0.70, rx: palmW * 0.43, rz: palmW * 0.20, cx: wrist.x + side * 0.008, cz: wrist.z },
         { y: wrist.y - handH, rx: palmW * 0.13, rz: palmW * 0.10, cx: wrist.x + side * 0.008, cz: wrist.z },
@@ -341,25 +517,42 @@ export function createParametricAvatar(
       thumb.position.set(wrist.x - side * palmW * 0.40, wrist.y - handH * 0.35, wrist.z + palmW * 0.16);
       thumb.rotation.z = side * 0.45;
 
-      const lx = side * legX;
-      const legRows: Section[] = [
+      const hipCenterX = photoShape ? hipProfile.cx || 0 : 0;
+      const hipCenterZ = photoShape ? hipProfile.cz || 0 : 0;
+      const lx = hipCenterX + side * legX;
+      const neutralLeg: Section[] = [
         { y: ankleY, rx: calfW * 0.25, rz: calfD * 0.27, cx: lx, cz: -0.005 },
         { y: ankleY + (kneeY - ankleY) * 0.22, rx: calfW * 0.31, rz: calfD * 0.32, cx: lx, cz: -0.010 },
         { y: calfPeakY, rx: calfW / 2, rz: calfD / 2, cx: lx, cz: -0.012 },
         { y: kneeY, rx: kneeW / 2, rz: kneeD / 2, cx: lx, cz: 0.007 },
         { y: kneeY + (I - kneeY) * 0.28, rx: thighW * 0.39, rz: thighD * 0.40, cx: lx, cz: 0.002 },
         { y: thighPeakY, rx: thighW / 2, rz: thighD / 2, cx: lx, cz: 0 },
-        { y: I + T * 0.06, rx: thighW * 0.45, rz: thighD * 0.47, cx: lx * 0.96, cz: -0.002 },
+        { y: I + T * 0.06, rx: thighW * 0.45, rz: thighD * 0.47, cx: hipCenterX + side * legX * 0.96, cz: -0.002 },
         // Bury the terminal cap inside the pelvis, rather than expose a flat
         // horizontal thigh cut outside the trunk silhouette.
-        { y: I + T * 0.25, rx: thighW * 0.10, rz: thighD * 0.12, cx: lx * 0.72, cz: -0.002 },
-      ];
+        { y: I + T * 0.25, rx: thighW * 0.10, rz: thighD * 0.12, cx: hipCenterX + side * legX * 0.72, cz: -0.002 },
+      ].map(s => ({ ...s, cz: s.cz + hipCenterZ }));
+      const legRows = withPhotoProfile(neutralLeg, photoShape?.legs[index], ankleY, I, {
+        lockSizeAt: d.thighCircumference.source === 'manual' ? [thighPeakY] : [],
+        maxCenterShift: 0.12,
+        // At the crotch the projected thigh merges with the other thigh,
+        // pelvis or hand. Blend into the overlap instead of widening both.
+        blendIntoTopAt: 0.78,
+      });
       const leg = add(loft(legRows, 106, 44), suit, side < 0 ? 'LeftLegSurface' : 'RightLegSurface');
       legMeshes.push(leg);
-      const footGeo = new THREE.SphereGeometry(1, 28, 22);
-      footGeo.scale(Math.max(calfW * 0.35, H * 0.025), footH / 2, H * 0.069);
-      const foot = add(footGeo, suit, side < 0 ? 'LeftFoot' : 'RightFoot');
-      foot.position.set(lx, footH / 2, H * 0.022);
+      const ankle = sectionAt(legRows, ankleY);
+      const footWidthRadius = Math.max(ankle.rx * 1.32, H * 0.025);
+      const footDepthRadius = H * 0.065;
+      const ankleDepth = ankle.cz || 0;
+      const footRows = [
+        { y: 0, rx: footWidthRadius * 0.8, rz: footDepthRadius * 0.86, cx: ankle.cx, cz: ankleDepth + H * 0.026 },
+        { y: ankleY * 0.28, rx: footWidthRadius, rz: footDepthRadius, cx: ankle.cx, cz: ankleDepth + H * 0.026 },
+        { y: ankleY * 0.63, rx: footWidthRadius * 0.93, rz: footDepthRadius * 0.79, cx: ankle.cx, cz: ankleDepth + H * 0.017 },
+        { ...ankle, y: ankleY, rx: ankle.rx * 0.99, rz: ankle.rz * 0.99 },
+        { ...ankle, y: ankleY + 0.012, rx: ankle.rx * 0.78, rz: ankle.rz * 0.78 },
+      ];
+      add(loft(footRows, 30, 32), suit, side < 0 ? 'LeftFoot' : 'RightFoot');
 
       if (c.bottomType !== 'none') {
         const fit = c.fit === 'oversized' ? 1.19 : c.fit === 'slim' ? 1.045 : 1.09;
@@ -395,10 +588,14 @@ export function createParametricAvatar(
         };
       });
       add(loft(rows, 100, 48, false), shirtMat, 'GarmentTorso', garments);
-      for (const armRows of armSectionsBySide) {
+      for (const [index, armRows] of armSectionsBySide.entries()) {
         const length = c.topType === 'tshirt' ? upperL * 0.57 : armL * 0.97;
-        const sleeveDrop = Math.max(0.04, length + sleeveShorten);
-        const topY = shoulderY + 0.009, endY = Math.max(armRows[0].y, shoulderY - sleeveDrop * Math.cos(armAngle));
+        const sleeveLength = clamp(length + sleeveShorten, 0.04, armL);
+        const frame = armFrames[index];
+        const endY = sleeveLength <= upperL
+          ? lerp(frame.shoulder.y, frame.elbow.y, sleeveLength / upperL)
+          : lerp(frame.elbow.y, frame.wrist.y, (sleeveLength - upperL) / foreL);
+        const topY = Math.min(shoulderY + 0.009, armRows.at(-1)!.y);
         const ys = Array.from(new Set([endY, ...armRows.filter(s => s.y > endY && s.y < topY).map(s => s.y), topY])).sort((a, b) => a - b);
         add(loft(ys.map(y => {
           const s = sectionAt(armRows, y);
@@ -408,8 +605,7 @@ export function createParametricAvatar(
     }
     if (c.bottomType !== 'none') {
       const fit = c.fit === 'oversized' ? 1.12 : c.fit === 'slim' ? 1.035 : 1.07;
-      const pelvisRows = [I, hipY, waistY].map(y => {
-        const s = sectionAt(torsoSections, y);
+      const pelvisRows = torsoSections.filter(s => s.y >= I && s.y <= waistY).map(s => {
         return { ...s, rx: Math.max(s.rx * fit + 0.005 + waistAdjust / (Math.PI * 2), 0.04), rz: Math.max(s.rz * fit + 0.006 + waistAdjust / (Math.PI * 2), 0.04) };
       });
       add(loft(pelvisRows, 60, 48), pantsMat, 'GarmentPelvis', garments);
@@ -420,7 +616,13 @@ export function createParametricAvatar(
     const bodyBox = modelBounds(body, root);
     const headBox = bounds(head.geometry);
     const shoulderSection = sectionExtent(torso.geometry, shoulderY);
-    const bellyBaseline = sectionAt(torsoSections, bellyY).rz + (sectionAt(torsoSections, bellyY).cz || 0);
+    const bellyRing = sectionAt(torsoSections, bellyY);
+    const bellyHasObservedDepth = photoShape?.torso.some(row =>
+      row.depthCm !== undefined && Math.abs(row.t - 0.48) < 0.05);
+    const bellyBaseline = bellyHasObservedDepth && d.bellyProtrusion.source !== 'manual'
+      ? lerp(sectionExtent(torso.geometry, hipY).max.z, sectionExtent(torso.geometry, chestY).max.z,
+        (bellyY - hipY) / (chestY - hipY))
+      : bellyRing.rz + (bellyRing.cz || 0);
     const bellyFront = sectionExtent(torso.geometry, bellyY).max.z;
     const arm = armFrames[0];
     const measurements: ModelMeshMeasurements = {
@@ -435,8 +637,8 @@ export function createParametricAvatar(
       measuredWaistCircumference: perimeter(torso.geometry, waistY),
       measuredBellyProtrusion: cm(Math.max(0, bellyFront - bellyBaseline)),
       measuredHipCircumference: perimeter(torso.geometry, hipY),
-      measuredUpperArmGirth: perimeter(armMeshes[0].geometry, shoulderY - upperL * 0.34 * Math.cos(armAngle)),
-      measuredForearmGirth: perimeter(armMeshes[0].geometry, shoulderY - (upperL + foreL * 0.28) * Math.cos(armAngle)),
+      measuredUpperArmGirth: perimeter(armMeshes[0].geometry, lerp(arm.shoulder.y, arm.elbow.y, 0.34)),
+      measuredForearmGirth: perimeter(armMeshes[0].geometry, lerp(arm.elbow.y, arm.wrist.y, 0.28)),
       measuredThighGirth: perimeter(legMeshes[0].geometry, thighPeakY),
       measuredCalfGirth: perimeter(legMeshes[0].geometry, calfPeakY),
       measuredArmLength: cm(arm.shoulder.distanceTo(arm.elbow) + arm.elbow.distanceTo(arm.wrist)),

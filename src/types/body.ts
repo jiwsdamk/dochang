@@ -66,6 +66,24 @@ export interface SilhouetteSlice {
   label: string;
 }
 
+/** A horizontal section of a photographic body region, calibrated in centimetres. */
+export interface BodyProfileRow {
+  t: number; // 0 at the bottom of the region, 1 at the top
+  widthCm: number;
+  centerXCm: number; // positive toward the right edge of the front photo
+  depthCm?: number;
+  centerZCm?: number; // positive toward the face; relative to the side hip center
+}
+
+export interface BodyPhotoProfile {
+  torso: BodyProfileRow[]; // crotch to shoulder
+  neck: BodyProfileRow[]; // shoulder to chin
+  head: BodyProfileRow[]; // chin to crown
+  arms: [BodyProfileRow[], BodyProfileRow[]]; // image left/right, wrist to shoulder
+  legs: [BodyProfileRow[], BodyProfileRow[]]; // image left/right, ankle to crotch
+  armWristHeightCm?: [number, number];
+}
+
 export interface PhotoAnalysisResult {
   /** Actual analysis-canvas dimensions; landmark coordinates are normalized to these. */
   frontImageWidth?: number;
@@ -109,6 +127,7 @@ export interface PhotoAnalysisResult {
 }
 
 export interface CalculatedBodyDimensions {
+  photoShape?: BodyPhotoProfile;
   height: DimensionMetric;
   headHeight: DimensionMetric;
   headWidth: DimensionMetric;

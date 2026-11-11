@@ -19,6 +19,7 @@ import {
 
 interface ThreeFittingRoomProps {
   dimensions: CalculatedBodyDimensions;
+  photoSource?: 'sample' | 'upload';
   clothingOptions: ClothingOptions;
   showTapeMeasures: boolean;
   onToggleTapeMeasures: () => void;
@@ -58,6 +59,7 @@ function frameAvatar(camera: THREE.PerspectiveCamera, controls: OrbitControls, h
 
 export const ThreeFittingRoom: React.FC<ThreeFittingRoomProps> = ({
   dimensions,
+  photoSource,
   clothingOptions,
   showTapeMeasures,
   onToggleTapeMeasures,
@@ -468,6 +470,11 @@ export const ThreeFittingRoom: React.FC<ThreeFittingRoomProps> = ({
           <p className="mt-0.5 text-[11px] text-slate-300">
             키 {dimensions.height.value}cm · 어깨 {dimensions.shoulderWidth.value}cm · 허리 {dimensions.waistCircumference.value}cm
           </p>
+          {photoSource && (
+            <p className="mt-1 text-[11px] text-cyan-200">
+              {photoSource === 'sample' ? '내장 예시 사진' : '업로드한 사진'} · {dimensions.photoShape ? '윤곽 기반 체형' : '치수 기반 체형'}
+            </p>
+          )}
         </div>
         <div role="group" aria-label="3D 조작" className="flex flex-wrap items-center gap-1.5">
           <div className="flex items-center divide-x divide-slate-700 rounded-lg border border-slate-700 bg-slate-950">

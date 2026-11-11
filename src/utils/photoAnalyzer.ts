@@ -11,6 +11,7 @@ import type {
 } from '../types/body';
 import { calculateRamanujanPerimeter, classifyBodyType } from './mathRamanujan';
 import { inspectPhotoPair, type PhotoPairObservation, type PhotoViewObservation, type Span } from './photoObservation';
+import { buildPhotoShape } from './photoShapeProfile';
 import { frontSample, sideSample } from '../assets/samplePhotos';
 
 export { inspectPhotoPair } from './photoObservation';
@@ -240,7 +241,8 @@ export function calculateBodyDimensions(input: BodyInputData, observations: Phot
     rightKnee: posePoint(f.landmarks[25].x < f.landmarks[26].x ? 26 : 25,'rightKnee','사진 오른쪽 무릎'),
     leftAnkle: posePoint(f.landmarks[27].x < f.landmarks[28].x ? 27 : 28,'leftAnkle','사진 왼쪽 발목'),
     rightAnkle: posePoint(f.landmarks[27].x < f.landmarks[28].x ? 28 : 27,'rightAnkle','사진 오른쪽 발목'),
-    crotch: fPoint('crotch','다리 분기점 추정',f.crotch),
+    crotch: fPoint('crotch',f.crotchDerived ? '다리 분기점 위치 추정'
+      : f.crotchRefinedByPixels ? '정면 분할과 배경 색으로 확인한 다리 분기점' : '정면 윤곽에서 다리 사이가 갈라지는 지점',f.crotch),
     groundFoot: fPoint('groundFoot','분할 윤곽 접지면',{x:(f.bounds.left+f.bounds.right)/2,y:f.bounds.bottom}),
     navel: fPoint('navel','복부 관측 높이',{x:(f.navel.left+f.navel.right)/2,y:f.navel.y}),
   };
@@ -310,6 +312,13 @@ export function calculateBodyDimensions(input: BodyInputData, observations: Phot
       frontPxWidth:metric.photoPixelObserved,calculatedCm:metric.value,formulaUsed:metric.formula??'',sourceCategory:metric.source,
     })),
   } as CalculatedBodyDimensions;
+  const photoShape = buildPhotoShape(observations, dimensions);
+  if (photoShape) {
+    dimensions.photoShape = photoShape;
+    if ([...photoShape.arms, ...photoShape.legs].some(rows => rows.some(row => row.centerZCm !== undefined && row.depthCm === undefined))) {
+      analysis.quality.notes.push('측면에서 겹친 팔다리는 깊이를 직접 관측할 수 없습니다. 앞뒤 위치는 보이는 쪽 관절을 기준으로 근사합니다.');
+    }
+  }
   return {analysis,dimensions};
 }
 

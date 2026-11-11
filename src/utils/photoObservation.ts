@@ -7,7 +7,9 @@ export interface Landmark {
   x: number; y: number; z?: number; visibility?: number; presence?: number;
 }
 export interface Point { x: number; y: number }
-export interface Span { left: number; right: number; y: number; derived: boolean }
+export interface HorizontalSpan { left: number; right: number }
+export interface MaskRow { y: number; spans: HorizontalSpan[] }
+export interface Span extends HorizontalSpan { y: number; derived: boolean }
 export interface LimbObservation {
   lengthPx: number;
   widthPx: number;
@@ -21,6 +23,7 @@ export interface PhotoViewObservation {
   landmarks: Landmark[];
   bounds: { left: number; right: number; top: number; bottom: number };
   contour: Point[];
+  maskRows?: MaskRow[];
   headTop: Point;
   chin: Point;
   shoulder: Point;
@@ -32,6 +35,7 @@ export interface PhotoViewObservation {
   head: Span;
   crotch: Point;
   crotchDerived: boolean;
+  crotchRefinedByPixels?: boolean;
   ankleY: number;
   chest: Span;
   waist: Span;
@@ -62,6 +66,41 @@ const median = (values: number[]) => {
 const mid = (a: Point, b: Point): Point => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 
+/** Follow a narrow, contrasting background gap already confirmed by the mask. */
+function refineCrotchGap(
+  split: Point, splitAt: (y: number) => number | undefined, bodyHeight: number,
+  pixels: Uint8ClampedArray, width: number, height: number,
+): Point {
+  const maxSearch = Math.round(bodyHeight * 0.035);
+  const flank = Math.max(3, Math.round(bodyHeight * 0.009));
+  const refY = Math.round(split.y + bodyHeight * 0.024);
+  const refX = splitAt(refY);
+  if (refX === undefined || refY + 1 >= height || refX < flank || refX + flank >= width) return split;
+  const pixel = (x: number, y: number) => {
+    const i = 4 * (y * width + x);
+    return [pixels[i], pixels[i + 1], pixels[i + 2]];
+  };
+  const colorDistance = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const background = pixel(Math.round(refX), refY);
+  if ([-1, 0, 1].some(dy => colorDistance(background, pixel(Math.round(refX), refY + dy)) > 18)) return split;
+  let lastX = Math.round(split.x);
+  let result = split;
+  for (let y = Math.round(split.y) + 1; y >= Math.max(0, split.y - maxSearch); y--) {
+    const candidates = [0, -1, 1, -2, 2].map(offset => lastX + offset);
+    const x = candidates.find(x => {
+      if (x < flank || x + flank >= width || Math.abs(x - split.x) > flank) return false;
+      const color = pixel(x, y);
+      return colorDistance(color, background) < 25
+        && colorDistance(color, pixel(x - flank, y)) > 35
+        && colorDistance(color, pixel(x + flank, y)) > 35;
+    });
+    if (x === undefined) break;
+    lastX = x;
+    if (y < split.y) result = { x, y };
+  }
+  return result;
+}
+
 /** Exported for deterministic mask-fixture tests; no DOM or AI calls are used here. */
 export function observePhotoMask(
   probabilities: Float32Array,
@@ -71,6 +110,7 @@ export function observePhotoMask(
   imageWidth: number,
   imageHeight: number,
   fingerprint = 'mask-fixture',
+  frontPixels?: Uint8ClampedArray,
 ): PhotoViewObservation {
   if (landmarks.length < 33 || probabilities.length !== maskWidth * maskHeight) {
     throw new Error('사진 분석 결과가 불완전해요. 전신이 보이는 사진으로 다시 시도해주세요.');
@@ -131,20 +171,21 @@ export function observePhotoMask(
     const t = clamp((y - shoulder.y) / Math.max(hipJoint.y - shoulder.y, 1), 0, 1);
     return shoulder.x * (1 - t) + hipJoint.x * t;
   };
-  const rows = (y: number): Array<{ left: number; right: number }> => {
-    const yy = clamp(Math.round(y / sy), 0, maskHeight - 1);
-    const result: Array<{ left: number; right: number }> = [];
+  const readMaskRow = (yy: number): MaskRow => {
+    const spans: HorizontalSpan[] = [];
     let start = -1;
     for (let x = 0; x <= maskWidth; x++) {
       const inside = x < maskWidth && binary[yy * maskWidth + x];
       if (inside && start < 0) start = x;
       if (!inside && start >= 0) {
-        if (x - start >= 2) result.push({ left: start * sx, right: x * sx });
+        spans.push({ left: start * sx, right: x * sx });
         start = -1;
       }
     }
-    return result;
+    return { y: yy * sy, spans };
   };
+  const maskRows = Array.from({ length: bottom - top + 1 }, (_, i) => readMaskRow(top + i));
+  const rows = (y: number) => maskRows[Math.round(y / sy) - top]?.spans ?? [];
   const at = (p: Point) => {
     const x = Math.round(p.x / sx), y = Math.round(p.y / sy);
     return x >= 0 && x < maskWidth && y >= 0 && y < maskHeight
@@ -216,22 +257,46 @@ export function observePhotoMask(
   const shoulderSlopeDeg = Math.atan2(Math.max(0,shoulder.y-neckBase),shoulderRun)*180/Math.PI;
   const headTop = { x: (centralSpan(bounds.top + sy, headX).left + centralSpan(bounds.top + sy, headX).right) / 2, y: bounds.top };
 
-  // Locate the actual split between the two legs below the hip pose joints.
+  // Match two separate silhouette runs to the pose thighs. The gap can be
+  // offset from the knee midpoint and can start above the model's hip joints.
   const kneeY = median([point(25).y, point(26).y]);
-  let crotchY: number | null = null;
-  const legCenter = mid(point(25), point(26)).x;
-  const maxGap = Math.abs(point(25).x - point(26).x) + bodyH * 0.08;
-  for (let y = hipJoint.y; y < hipJoint.y + (kneeY - hipJoint.y) * 0.70; y += sy) {
-    const segments = rows(y);
-    for (let j = 0; j + 1 < segments.length; j++) {
-      const gapL = segments[j].right, gapR = segments[j + 1].left;
-      if (gapL <= legCenter && gapR >= legCenter && gapR - gapL > sx && gapR - gapL < maxGap) {
-        crotchY = y; break;
-      }
+  const thighAxes = [[point(23), point(25)], [point(24), point(26)]];
+  const splitAt = (y: number): number | undefined => {
+    const axes = thighAxes.map(([hip, knee]) => {
+      const t = clamp((y - hip.y) / Math.max(knee.y - hip.y, sy), 0, 1);
+      return hip.x + (knee.x - hip.x) * t;
+    }).sort((a, b) => a - b);
+    const separation = axes[1] - axes[0];
+    if (separation < bodyH * 0.035) return;
+    const tolerance = Math.max(2 * sx, separation * 0.18);
+    const spans = rows(y).filter(span => span.right - span.left > separation * 0.22);
+    for (let j = 0; j + 1 < spans.length; j++) {
+      const l = spans[j], r = spans[j + 1];
+      const gap = r.left - l.right;
+      if (gap < sx * 0.95 || gap > separation * 0.85) continue;
+      if (axes[0] >= l.left - tolerance && axes[0] <= l.right + tolerance
+        && axes[1] >= r.left - tolerance && axes[1] <= r.right + tolerance) return (l.right + r.left) / 2;
     }
-    if (crotchY !== null) break;
+  };
+  const splitStart = Math.ceil((hipJoint.y - bodyH * 0.055) / sy);
+  const splitEnd = Math.floor((hipJoint.y + (kneeY - hipJoint.y) * 0.7) / sy);
+  const stableRows = Math.max(3, Math.round(bodyH * 0.012 / sy));
+  let crotch: Point | undefined;
+  for (let row = splitStart; row <= splitEnd; row++) {
+    const y = row * sy, x = splitAt(y);
+    if (x === undefined) continue;
+    let matches = 1;
+    for (let k = 1; k < stableRows; k++) if (splitAt(y + k * sy) !== undefined) matches++;
+    if (matches >= Math.ceil(stableRows * 0.8)) { crotch = { x, y }; break; }
   }
-  const crotch = { x: legCenter, y: crotchY ?? hipJoint.y + (kneeY - hipJoint.y) * 0.14 };
+  const crotchDerived = crotch === undefined;
+  let crotchRefinedByPixels = false;
+  if (crotch && frontPixels?.length === imageWidth * imageHeight * 4) {
+    const refined = refineCrotchGap(crotch, splitAt, bodyH, frontPixels, imageWidth, imageHeight);
+    crotchRefinedByPixels = refined.y < crotch.y;
+    crotch = refined;
+  }
+  crotch ??= { x: hipJoint.x, y: hipJoint.y + (kneeY - hipJoint.y) * 0.14 };
 
   const sampleLimb = (a: Point, b: Point): LimbObservation => {
     const length = distance(a, b);
@@ -301,12 +366,12 @@ export function observePhotoMask(
   const footHeightPx = bounds.bottom - ankleY;
   return {
     width: imageWidth, height: imageHeight, landmarks, bounds,
-    contour: [...contourLeft, ...contourRight.reverse()],
+    contour: [...contourLeft, ...contourRight.reverse()], maskRows,
     headTop, chin, shoulder, shoulderSurface,
     shoulderSpanPx: Math.abs(point(12).x - point(11).x),
     shoulderTiltDeg: Math.atan2(Math.abs(point(12).y - point(11).y), Math.abs(point(12).x - point(11).x)) * 180 / Math.PI,
     shoulderSlopeDeg,
-    neck, head, crotch, crotchDerived: crotchY === null, ankleY, chest, waist, hip, navel,
+    neck, head, crotch, crotchDerived, crotchRefinedByPixels, ankleY, chest, waist, hip, navel,
     upperArm: chooseLimb([[11, 13], [12, 14]]),
     forearm: chooseLimb([[13, 15], [14, 16]]),
     thigh: chooseLimb([[23, 25], [24, 26]]),
@@ -510,7 +575,7 @@ async function observeImage(source: string, name: string): Promise<PhotoViewObse
     let hash = 2166136261;
     for (let i = 0; i < pixels.length; i += 31) hash = Math.imul(hash ^ pixels[i], 16777619);
     observation = observePhotoMask(new Float32Array(mask.getAsFloat32Array()), mask.width, mask.height,
-      landmarks.map(l => ({ ...l })), canvas.width, canvas.height, (hash >>> 0).toString(16));
+      landmarks.map(l => ({ ...l })), canvas.width, canvas.height, (hash >>> 0).toString(16), name === '정면' ? pixels : undefined);
     let totalLuminance = 0, sampledPixels = 0;
     for (let i = 0; i < pixels.length; i += 128) {
       totalLuminance += pixels[i] * 0.2126 + pixels[i + 1] * 0.7152 + pixels[i + 2] * 0.0722;
